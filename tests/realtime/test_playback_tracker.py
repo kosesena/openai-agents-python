@@ -100,6 +100,39 @@ class TestPlaybackTracker:
         # The truncation point stays within the audio the client actually received.
         assert truncate_events[0].audio_end_ms == 1000
 
+    @pytest.mark.parametrize(
+        ("ongoing_response_id", "expected_truncates"),
+        [("r2", []), ("r1", [("item_1", 1000)])],
+    )
+    @pytest.mark.asyncio
+    async def test_interrupt_forces_truncate_only_for_audio_of_the_ongoing_response(
+        self, model, ongoing_response_id, expected_truncates
+    ):
+        """Only the response that owns the audio can still extend it.
+
+        An item from an earlier response that has fully played must not be truncated just
+        because a later, audio-less response (for example a tool call) is in progress.
+        """
+        model._send_raw_message = AsyncMock()
+        model._audio_state_tracker.set_audio_format("pcm16")
+
+        # 48_000 bytes of PCM16 at 24kHz equals ~1000ms of audio.
+        model._audio_state_tracker.on_audio_delta("item_1", 0, b"a" * 48_000, response_id="r1")
+        await model._mark_response_created(ongoing_response_id)
+        model._playback_tracker = RealtimePlaybackTracker()
+        model._playback_tracker.on_play_ms("item_1", 0, 1000.0)
+
+        await model._send_interrupt(RealtimeModelSendInterrupt())
+
+        truncate_events = [
+            call.args[0]
+            for call in model._send_raw_message.await_args_list
+            if getattr(call.args[0], "type", None) == "conversation.item.truncate"
+        ]
+        assert [(event.item_id, event.audio_end_ms) for event in truncate_events] == (
+            expected_truncates
+        )
+
     @pytest.mark.asyncio
     async def test_interrupt_clamps_truncate_to_received_audio_while_response_ongoing(self, model):
         """Default timing must not truncate past the audio the client received.

@@ -1331,6 +1331,100 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
         assert truncate_events
         assert truncate_events[0].audio_end_ms == 1000
 
+    async def _play_completed_response_then_speak(
+        self, model, monkeypatch, *, start_second_response: bool, finish_first_response: bool
+    ) -> list[Any]:
+        """Stream 1000ms of audio for r1, let it play out, then start speaking.
+
+        Optionally finish r1 and start an audio-less r2 (for example a tool-call-only
+        response) before the user speaks.
+        """
+        monkeypatch.setattr(model, "_websocket", AsyncMock())
+        monkeypatch.setattr(model, "_send_raw_message", AsyncMock())
+
+        def response(response_id: str, status: str) -> dict[str, Any]:
+            return {
+                "id": response_id,
+                "object": "realtime.response",
+                "status": status,
+                "output": [],
+            }
+
+        await model._handle_ws_event(
+            {
+                "type": "response.created",
+                "event_id": "e1",
+                "response": response("r1", "in_progress"),
+            }
+        )
+        await model._handle_ws_event(
+            {
+                "type": "response.output_audio.delta",
+                "event_id": "e2",
+                "response_id": "r1",
+                "item_id": "a1",
+                "output_index": 0,
+                "content_index": 0,
+                # 48_000 bytes of PCM16 at 24kHz equals 1000ms of audio.
+                "delta": base64.b64encode(b"\x00" * 48_000).decode(),
+            }
+        )
+        if finish_first_response:
+            await model._handle_ws_event(
+                {"type": "response.done", "event_id": "e3", "response": response("r1", "completed")}
+            )
+        state = model._audio_state_tracker.get_state("a1", 0)
+        assert state is not None
+        state.initial_received_time = time.monotonic() - 5
+        if start_second_response:
+            await model._handle_ws_event(
+                {
+                    "type": "response.created",
+                    "event_id": "e4",
+                    "response": response("r2", "in_progress"),
+                }
+            )
+
+        await model._handle_ws_event(
+            {
+                "type": "input_audio_buffer.speech_started",
+                "event_id": "e5",
+                "item_id": "u1",
+                "audio_start_ms": 0,
+            }
+        )
+        return [
+            call.args[0]
+            for call in model._send_raw_message.await_args_list
+            if getattr(call.args[0], "type", None) == "conversation.item.truncate"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_speech_started_skips_truncate_of_heard_audio_during_audio_less_response(
+        self, model, monkeypatch
+    ):
+        """A later response that owns no audio must not truncate audio already heard in full.
+
+        Truncating drops the item's transcript on the server, so the model would lose what
+        it just said whenever the user talks during a tool-call-only response.
+        """
+        truncate_events = await self._play_completed_response_then_speak(
+            model, monkeypatch, start_second_response=True, finish_first_response=True
+        )
+
+        assert truncate_events == []
+
+    @pytest.mark.asyncio
+    async def test_speech_started_truncates_audio_of_the_response_still_streaming(
+        self, model, monkeypatch
+    ):
+        """The response that owns the audio may still extend it, so it is still truncated."""
+        truncate_events = await self._play_completed_response_then_speak(
+            model, monkeypatch, start_second_response=False, finish_first_response=False
+        )
+
+        assert [(event.item_id, event.audio_end_ms) for event in truncate_events] == [("a1", 1000)]
+
 
 class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
     @pytest.mark.asyncio
